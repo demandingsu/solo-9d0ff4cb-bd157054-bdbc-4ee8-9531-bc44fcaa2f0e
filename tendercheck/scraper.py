@@ -5,6 +5,7 @@ import os
 import re
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 from typing import Optional
 from urllib.parse import (
     parse_qsl,
@@ -63,6 +64,35 @@ class Candidate:
     list_time: Optional[datetime]
     related: bool
     fallback: bool = False
+
+    def merge_listing_info(self, other: "Candidate") -> None:
+        """Keep the usable catalog information from every page a link appears on.
+
+        Mixed catalogs can expose different fields on different pages (e.g. the
+        project number only on one page, the publish time on another). A link is
+        fetched only once, so merge what each listing occurrence contributes.
+        """
+
+        self.related = self.related or other.related
+        if self.list_time is None and other.list_time is not None:
+            self.list_time = other.list_time
+        if (not self.title or self.title == "未命名公告") and other.title:
+            self.title = other.title
+        extra_context = clean_text(other.context)
+        if extra_context and extra_context not in self.context:
+            self.context = clean_text(f"{self.context} {extra_context}")
+
+
+class DetailRejection(Enum):
+    ACCEPTED = "accepted"
+    OTHER_PROJECT = "other_project"
+    UNCONFIRMED = "unconfirmed"
+
+
+@dataclass
+class DetailParseOutcome:
+    announcement: Optional[Announcement]
+    reason: DetailRejection
 
 
 _TRACKING_QUERY_KEYS = {
@@ -367,9 +397,12 @@ class TenderScraper:
 
             for candidate in page_candidates:
                 key = canonical_url(candidate.url)
-                if key in candidates_by_url:
-                    if candidate.related:
-                        duplicate_links += 1
+                existing = candidates_by_url.get(key)
+                if existing is not None:
+                    # The same detail link can appear on several pages; fetch it
+                    # only once but retain every usable piece of catalog info.
+                    duplicate_links += 1
+                    existing.merge_listing_info(candidate)
                     continue
                 candidates_by_url[key] = candidate
 
@@ -602,23 +635,42 @@ class TenderScraper:
         return False
 
     def _select_candidates(self, candidates: list[Candidate]) -> tuple[list[Candidate], list[str]]:
-        related = [candidate for candidate in candidates if candidate.related]
-        if related:
-            selected = related
-        else:
-            # Some real list pages only show a generic title and put the project
-            # number in the detail page. Bound this fallback to keep it safe.
-            selected = candidates[: self.max_details]
-            for candidate in selected:
-                candidate.fallback = True
+        """Plan which detail pages to fetch.
+
+        Three kinds of catalog rows are handled differently:
+
+        * rows naming the target project number are related and always fetched;
+        * rows naming another project number belong to that other project and
+          are excluded without spending the detail budget on them;
+        * rows showing only a generic title (no project number anywhere in the
+          catalog record) are fetched so the detail page can confirm ownership.
+        """
+
+        related: list[Candidate] = []
+        unnumbered: list[Candidate] = []
+        for candidate in candidates:
+            if candidate.related:
+                related.append(candidate)
+                continue
+            catalog_project = extract_project_number(candidate.context)
+            if catalog_project and not project_mentioned(catalog_project, self.project_no):
+                # The catalog itself attributes this record to another project.
+                continue
+            candidate.fallback = True
+            unnumbered.append(candidate)
 
         issues: list[str] = []
-        if related and len(related) > self.max_details:
+        if len(related) > self.max_details:
             issues.append(f"相关详情链接超过上限 {self.max_details}，可能存在未核对的公告")
-        elif not related and len(candidates) > self.max_details:
-            issues.append(f"候选详情链接超过上限 {self.max_details}，可能存在未核对的公告")
-        if len(selected) > self.max_details:
-            selected = selected[: self.max_details]
+        budget = max(0, self.max_details - len(related))
+        if len(unnumbered) > budget:
+            issues.append(
+                f"目录未标明项目编号的记录无法在详情上限 {self.max_details} 内全部核实，"
+                "未确认的记录可能与本项目相关"
+            )
+
+        # Hard cap: never fetch more detail pages than the configured budget.
+        selected = related[: self.max_details] + unnumbered[:budget]
         return selected, issues
 
     def _fetch_details(self, candidates: list[Candidate]) -> tuple[list[Announcement], list[str], int]:
@@ -647,33 +699,60 @@ class TenderScraper:
                             source_note="详情页抓取失败，标题/时间来自列表页",
                         )
                     )
-                elif candidate.fallback:
+                else:
+                    # The catalog row has no project number, so a failed detail
+                    # page means ownership can neither be confirmed nor excluded.
                     issues.append(
-                        f"候选详情页抓取失败，且列表页未标明项目编号，无法排除相关性：{candidate.url}（{exc}）"
+                        "目录未标明项目编号的公告详情读取失败，无法确认归属："
+                        f"《{candidate.title}》（{candidate.url}，{exc}）"
                     )
                 continue
 
-            announcement = self._parse_detail_page(page, candidate)
-            if announcement is not None:
-                announcements.append(announcement)
+            parsed = self._parse_detail_candidate(page, candidate)
+            if parsed.announcement is not None:
+                announcements.append(parsed.announcement)
+            elif parsed.reason == DetailRejection.UNCONFIRMED and candidate.fallback:
+                issues.append(
+                    "公告详情未标明项目编号，无法确认是否归属本项目："
+                    f"《{candidate.title}》（{candidate.url}）"
+                )
 
         return announcements, issues, detail_count
 
-    def _parse_detail_page(self, page: FetchedPage, candidate: Candidate) -> Optional[Announcement]:
+    def _parse_detail_candidate(
+        self, page: FetchedPage, candidate: Candidate
+    ) -> "DetailParseOutcome":
+        """Parse a detail page and decide whether the record belongs to us."""
+
         soup = page.soup
         content = clean_text(soup.get_text(" ", strip=True))
         title = self._extract_detail_title(soup) or candidate.title
         explicit_type = extract_explicit_kind(content)
         kind = detect_kind(title, content, explicit_type)
-        if kind == KIND_OTHER:
-            return None
 
         declared_project = extract_project_number(content)
-        if declared_project and not project_mentioned(declared_project, self.project_no):
-            return None
-        detail_mentions_project = project_mentioned(f"{title} {content}", self.project_no)
-        if not detail_mentions_project and not candidate.related:
-            return None
+        if not declared_project:
+            # Some detail pages expose the number only in a data attribute.
+            declared_project = self._extract_detail_project_attribute(soup)
+
+        mentions_project = project_mentioned(f"{title} {content}", self.project_no)
+        belongs = bool(declared_project and project_mentioned(declared_project, self.project_no)) or (
+            candidate.related and mentions_project
+        )
+
+        if not belongs:
+            if declared_project or mentions_project:
+                # The detail clearly belongs to another project: exclude it.
+                return DetailParseOutcome(None, DetailRejection.OTHER_PROJECT)
+            if kind == KIND_OTHER:
+                # Not a tender/correction/cancellation record at all.
+                return DetailParseOutcome(None, DetailRejection.OTHER_PROJECT)
+            if candidate.fallback:
+                return DetailParseOutcome(None, DetailRejection.UNCONFIRMED)
+            return DetailParseOutcome(None, DetailRejection.OTHER_PROJECT)
+
+        if kind == KIND_OTHER:
+            return DetailParseOutcome(None, DetailRejection.OTHER_PROJECT)
 
         detail_publish_time = self._extract_detail_publish_time(soup, content)
         publish_time = detail_publish_time or candidate.list_time
@@ -681,8 +760,11 @@ class TenderScraper:
         source_note = None
         if detail_publish_time is None and candidate.list_time is not None:
             source_note = "发布时间取自列表页"
+        if candidate.fallback:
+            note = "目录未标明项目编号，归属经详情页确认"
+            source_note = f"{source_note}；{note}" if source_note else note
 
-        return Announcement(
+        announcement = Announcement(
             url=page.url,
             title=title,
             kind=kind,
@@ -693,6 +775,14 @@ class TenderScraper:
             found_on=candidate.found_on,
             source_note=source_note,
         )
+        return DetailParseOutcome(announcement, DetailRejection.ACCEPTED)
+
+    def _extract_detail_project_attribute(self, soup: BeautifulSoup) -> Optional[str]:
+        for node in soup.find_all(attrs={"data-project-no": True})[:5]:
+            value = clean_text(node.get("data-project-no"))
+            if value:
+                return value
+        return None
 
     def _extract_detail_title(self, soup: BeautifulSoup) -> Optional[str]:
         for selector in ("h1", ".article-title", ".detail-title", ".notice-title", ".title"):

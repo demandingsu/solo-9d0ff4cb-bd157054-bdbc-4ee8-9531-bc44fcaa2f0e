@@ -44,7 +44,11 @@ class ScraperIntegrationTests(unittest.TestCase):
         result = self.check("GSB-2026-001")
         self.assertEqual(len(result.pages), 3)
         self.assertEqual(result.announcement_count, 3)
-        self.assertEqual(result.duplicates_skipped, 2)
+        # d-001-original appears on pages 2 and 3; d-001-correction-1 also
+        # appears on both pages 2 and 3. Each cross-page repeat is fetched once
+        # and counted as a merged duplicate, including catalog rows that did not
+        # expose the project number on every occurrence.
+        self.assertEqual(result.duplicates_skipped, 3)
         self.assertEqual(result.deadline.strftime("%Y-%m-%d %H:%M"), "2026-11-27 17:00")
 
     def test_cancelled_project_ignores_later_correction(self):

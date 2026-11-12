@@ -4,7 +4,19 @@ from pathlib import Path
 from urllib.parse import urljoin, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1] / "sample_site"
-INTENTIONALLY_MISSING = {"/detail/d-004-correction.html"}
+INTENTIONALLY_MISSING = {
+    "/detail/d-004-correction.html",
+    "/detail/m-002-correction.html",
+}
+CATALOG_PAGES = [
+    "index.html",
+    "notices/page-1.html",
+    "notices/page-2.html",
+    "notices/page-3.html",
+    "mixed/page-1.html",
+    "mixed/page-2.html",
+    "verify/page-1.html",
+]
 
 
 class LinkParser(HTMLParser):
@@ -26,7 +38,7 @@ class SampleSiteTests(unittest.TestCase):
         return parser.links
 
     def test_local_links_exist_except_intentional_404(self):
-        for page in ["index.html", "notices/page-1.html", "notices/page-2.html", "notices/page-3.html"]:
+        for page in CATALOG_PAGES:
             with self.subTest(page=page):
                 for link in self.parse_links(page):
                     if link.startswith(("http://", "https://", "mailto:", "#")):
@@ -47,6 +59,30 @@ class SampleSiteTests(unittest.TestCase):
         page_three = "\n".join(self.parse_links("notices/page-3.html"))
         self.assertIn("d-001-original.html", page_two)
         self.assertIn("d-001-original.html", page_three)
+
+    def test_mixed_catalog_pagination_and_repeated_link(self):
+        first = "\n".join(self.parse_links("mixed/page-1.html"))
+        second = "\n".join(self.parse_links("mixed/page-2.html"))
+        self.assertIn("page-2.html", first)
+        # The generic-title cancel link repeats across pages but stays unnumbered
+        # in the catalog; its project number only exists in the detail page.
+        self.assertIn("m-001-cancel.html", first)
+        self.assertIn("m-001-cancel.html", second)
+
+    def test_mixed_catalog_keeps_project_numbers_out_of_listing(self):
+        for page in ("mixed/page-1.html", "mixed/page-2.html"):
+            with self.subTest(page=page):
+                text = (ROOT / page).read_text(encoding="utf-8")
+                # GSB-2026-006 records must only carry generic titles in the catalog.
+                self.assertNotIn("GSB-2026-006", text)
+        # The detail pages still declare the project number.
+        detail = (ROOT / "detail/m-001-cancel.html").read_text(encoding="utf-8")
+        self.assertIn("GSB-2026-006", detail)
+
+    def test_verify_catalog_links_to_intentionally_missing_detail(self):
+        links = "\n".join(self.parse_links("verify/page-1.html"))
+        self.assertIn("m-002-correction.html", links)
+        self.assertFalse((ROOT / "detail/m-002-correction.html").exists())
 
 
 if __name__ == "__main__":
